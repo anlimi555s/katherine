@@ -1,0 +1,11 @@
+[package]
+name = "katherine-core"
+version = "0.1.0"
+edition = "2021"
+description = "Katherine engine — core types and traits"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+futures = "0.3"
+async-trait = { workspace = true }
