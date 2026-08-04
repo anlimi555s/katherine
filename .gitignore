@@ -1,0 +1,42 @@
+# Katherine — 敏感文件，勿提交
+
+# API 密钥
+.env
+**/config.json
+
+# 身份与状态（个人数据）
+**/identity.json
+**/rules.md
+**/session.md
+**/state.json
+**/MEMORY.md
+**/corrections/
+**/decisions/
+**/insights/
+**/neuro/
+**/sessions/
+**/thinking/
+
+# 数据库
+**/katherine.db
+**/katherine.db-*
+
+# 向量存储
+**/chroma/
+
+# Browser 运行痕迹
+**/browser-profile/
+
+# 构建产物
+target/
+**/*.rs.bk
+
+# Chrome 二进制——太大，自行下载
+bin/
+
+# 日志
+*.log
+
+# IDE
+.vscode/
+.idea/

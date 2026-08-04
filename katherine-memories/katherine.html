@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Katherine</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#0d1117; color:#c9d1d9; font:14px/1.6 'Segoe UI',system-ui,sans-serif; height:100vh; display:flex; flex-direction:column; }
+  #tabs { display:flex; background:#161b22; border-bottom:1px solid #21262d; }
+  #tabs button { padding:8px 20px; border:none; background:none; color:#8b949e; cursor:pointer; font:inherit; font-size:13px; border-bottom:2px solid transparent; }
+  #tabs button.active { color:#c9d1d9; border-bottom-color:#58a6ff; }
+  #tab-content { flex:1; overflow:hidden; display:flex; flex-direction:column; }
+  .tab { display:none; flex:1; overflow:hidden; flex-direction:column; }
+  .tab.active { display:flex; }
+
+  /* ── Chat ── */
+  #messages { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:8px; }
+  .msg { max-width:85%; padding:10px 14px; border-radius:10px; white-space:pre-wrap; word-break:break-word; }
+  .msg.selena { align-self:flex-end; background:#238636; color:#fff; }
+  .msg.katherine { align-self:flex-start; background:#21262d; border:1px solid #30363d; }
+  .tools { display:flex; flex-direction:column; gap:3px; margin-bottom:8px; align-self:flex-start; max-width:85%; }
+  .tool-line { font-size:12px; padding:5px 10px; border-radius:4px; background:#161b22; border-left:2px solid #30363d; color:#8b949e; cursor:pointer; display:flex; justify-content:space-between; align-items:flex-start; gap:8px; }
+  .tool-line:hover { background:#1c2128; }
+  .tool-line.running { border-left-color:#d29922; }
+  .tool-line.ok { border-left-color:#3fb950; }
+  .tool-line.err { border-left-color:#f85149; }
+  .thinking { font-size:12px; color:#6e7681; padding:4px 0; cursor:pointer; }
+  .thinking .think-preview { font-style:italic; }
+  .thinking .think-full { display:none; white-space:pre-wrap; margin-top:4px; padding:8px; background:#0d1117; border-radius:4px; max-height:200px; overflow-y:auto; }
+  .thinking.open .think-full { display:block; }
+  .thinking.open .think-preview { display:none; }
+  .tool-args { color:#58a6ff; font-family:'Cascadia Code',Consolas,monospace; font-size:11px; word-break:break-all; }
+  .tool-result { display:none; font-size:12px; color:#8b949e; padding:6px 10px; margin-top:2px; background:#0d1117; border-radius:4px; white-space:pre-wrap; word-break:break-all; max-height:120px; overflow-y:auto; font-family:'Cascadia Code',Consolas,monospace; }
+  .tool-result.open { display:block; }
+  #chat-input { display:flex; padding:12px 16px; gap:8px; border-top:1px solid #21262d; }
+  #input { flex:1; padding:10px; border-radius:8px; border:1px solid #30363d; background:#0d1117; color:#c9d1d9; resize:none; font:inherit; }
+  #send, #stop { padding:10px 20px; border-radius:8px; border:none; color:#fff; cursor:pointer; font:inherit; }
+  #send { background:#238636; display:block; }
+  #send:hover { background:#2ea043; }
+  #send:disabled { opacity:0.5; }
+  #stop { background:#da3633; display:none; }
+  #stop:hover { background:#f85149; }
+
+  /* ── Dashboard ── */
+  #dash { padding:16px; overflow-y:auto; display:flex; flex-wrap:wrap; gap:12px; }
+  .card { background:#161b22; border:1px solid #21262d; border-radius:8px; padding:14px; flex:1; min-width:240px; }
+  .card h3 { font-size:12px; color:#8b949e; margin-bottom:6px; text-transform:uppercase; letter-spacing:0.5px; }
+  .row { display:flex; justify-content:space-between; padding:3px 0; font-size:13px; }
+  .label { color:#8b949e; }
+  .val { font-weight:600; }
+  .ok { color:#3fb950; } .warn { color:#d29922; } .err { color:#f85149; }
+  .bar { height:5px; background:#21262d; border-radius:3px; margin-top:4px; }
+  .bar-fill { height:100%; border-radius:3px; transition:width 0.5s; }
+  .bar-fill.low { background:#3fb950; } .bar-fill.mid { background:#d29922; } .bar-fill.high { background:#f85149; }
+
+  /* ── Status bar ── */
+  #footer { display:flex; align-items:center; gap:10px; padding:8px 16px; border-top:1px solid #21262d; background:#161b22; font-size:12px; }
+  #status-dot { width:8px; height:8px; border-radius:50%; }
+  #status-dot.idle { background:#8b949e; }
+  #status-dot.thinking { background:#d29922; animation:pulse 0.8s infinite; }
+  #status-dot.coding { background:#58a6ff; animation:pulse 0.5s infinite; }
+  #status-dot.reading { background:#3fb950; }
+  #status-dot.error { background:#f85149; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  #status-text { color:#8b949e; }
+</style>
+</head>
+<body>
+<div id="tabs">
+  <button id="tab-chat-btn" class="active" onclick="switchTab('chat')">聊天</button>
+  <button id="tab-dash-btn" onclick="switchTab('dash')">仪表盘</button>
+</div>
+
+<div id="tab-content">
+  <div id="tab-chat" class="tab active">
+    <div id="messages"></div>
+    <div id="chat-input">
+      <textarea id="input" rows="2" placeholder="给 Katherine 发消息..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}"></textarea>
+      <button id="send" onclick="send()">发送</button>
+      <button id="stop" onclick="abort()">停止</button>
+    </div>
+  </div>
+  <div id="tab-dash" class="tab">
+    <div id="dash">
+      <div class="card"><h3>引擎</h3>
+        <div class="row"><span class="label">运行</span><span id="d-uptime" class="val">—</span></div>
+        <div class="row"><span class="label">轮次</span><span id="d-turns" class="val">—</span></div>
+        <div class="row"><span class="label">Token</span><span id="d-tokens" class="val">—</span></div>
+      </div>
+      <div class="card"><h3>压力</h3>
+        <div class="row"><span class="label">%</span><span id="d-pressure" class="val">—</span></div>
+        <div class="bar"><div id="d-bar" class="bar-fill low" style="width:0%"></div></div>
+        <div class="row"><span class="label">API</span><span id="d-api" class="val">—</span></div>
+      </div>
+      <div class="card"><h3>退化</h3>
+        <div class="row"><span class="label">重复</span><span id="d-rep" class="val">—</span></div>
+        <div class="row"><span class="label">睡眠</span><span id="d-sleep" class="val">—</span></div>
+        <div class="row"><span class="label">错误</span><span id="d-err" class="val">—</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="footer">
+  <div id="status-dot" class="idle"></div>
+  <span id="status-text">Katherine 就位</span>
+</div>
+
+<script>
+const ENGINE = 'http://127.0.0.1:9876';
+let history = [];           // server-side conversation context (Anthropic API format)
+let messages = [];          // client-side render array
+let generating = false;     // concurrency lock
+let streamAbort = null;
+
+// ── Tab switch ─────────────────────────────────────────
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('#tabs button').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  document.getElementById('tab-'+name+'-btn').classList.add('active');
+  if (name === 'dash') refreshDash();
+}
+
+// ── Tool arg helper ─────────────────────────────────────
+
+function toolArgs(name, input) {
+  if (!input || typeof input !== 'object') return '';
+  if (/bash/i.test(name)) return input.command || '';
+  if (/read|write|edit/i.test(name)) {
+    const p = input.file_path || '';
+    return p.split(/[/\\]/).pop() || p;
+  }
+  if (/grep|glob/i.test(name)) return input.pattern || '';
+  if (name === 'recall') return input.query || '';
+  if (name === 'mark_memory') {
+    const c = input.content || '';
+    return c.slice(0, 60) + (c.length > 60 ? '…' : '');
+  }
+  if (name === 'browser') return input.action || '';
+  return '';
+}
+
+// ── Render: rebuild entire messages container from array ──
+
+function renderAll() {
+  const container = document.getElementById('messages');
+  let html = '';
+  for (const m of messages) {
+    if (m.role === 'user') {
+      html += `<div class="msg selena">${escHtml(m.text)}</div>`;
+    } else {
+      // thinking
+      if (m.thinking) {
+        const preview = m.thinking.slice(0, 80).replace(/\n/g, ' ');
+        html += `<div class="thinking" onclick="this.classList.toggle('open')">
+          <div class="think-preview">∴ ${escHtml(preview)}${m.thinking.length>80?'…':''} (${m.thinking.length} 字)</div>
+          <div class="think-full">${escHtml(m.thinking)}</div></div>`;
+      }
+      // tools
+      if (m.tools && m.tools.length > 0) {
+        html += '<div class="tools">';
+        for (const t of m.tools) {
+          const args = t.args ? ` <span class="tool-args">${escHtml(t.args)}</span>` : '';
+          const resultDiv = t.result != null
+            ? `<div class="tool-result" onclick="event.stopPropagation();this.classList.toggle('open')">${escHtml(t.result)}</div>`
+            : '';
+          html += `<div class="tool-line ${t.status}" onclick="event.stopPropagation();this.querySelector('.tool-result')?.classList.toggle('open')">${t.icon} ${t.name}${args}${resultDiv}</div>`;
+        }
+        html += '</div>';
+      }
+      // reply text
+      if (m.text) {
+        html += `<div class="msg katherine">${escHtml(m.text)}</div>`;
+      }
+      // error
+      if (m.error) {
+        html += `<div class="msg katherine" style="border-color:#f85149">⚠ ${escHtml(m.error)}</div>`;
+      }
+    }
+  }
+  container.innerHTML = html;
+  container.scrollTop = container.scrollHeight;
+}
+
+// ── Send ───────────────────────────────────────────────
+
+async function send() {
+  if (generating) return;
+  const input = document.getElementById('input');
+  const p = input.value.trim();
+  if (!p) return;
+  input.value = '';
+
+  generating = true;
+  document.getElementById('send').style.display = 'none';
+  document.getElementById('stop').style.display = 'block';
+  setStatus('thinking');
+
+  // Push user message
+  messages.push({role:'user', text:p});
+  renderAll();
+
+  // Streaming state — not yet in messages array
+  let katMsg = {role:'assistant', text:'', thinking:'', tools:[], error:''};
+  messages.push(katMsg);
+  let assistantContent = [];
+
+  try {
+    if (streamAbort) streamAbort.abort();
+    streamAbort = new AbortController();
+    const resp = await fetch(ENGINE+'/chat/stream', {
+      method:'POST', signal:streamAbort.signal,
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({prompt:p, history})
+    });
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, {stream:true});
+      const lines = buf.split('\n');
+      buf = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        if (line.startsWith('data: [DONE]')) continue;
+        try {
+          const ev = JSON.parse(line.slice(6));
+          const ty = ev.type || ev;
+          if (typeof ty === 'object') continue;
+
+          if (ty === 'thinking') {
+            katMsg.thinking = ev.thinking||'';
+          } else if (ty === 'Text' || ty === 'text') {
+            katMsg.text += (ev.text||'');
+            assistantContent.push({type:'text', text: ev.text||''});
+          } else if (ty === 'ToolCall' || ty === 'tool_call') {
+            const name = ev.name||'?';
+            const id = ev.id||'';
+            katMsg.tools.push({icon:'◌', name, args:toolArgs(name, ev.input), status:'running', id, result:null});
+            assistantContent.push({type:'tool_use', id, name, input: ev.input||{}});
+            setStatus(/read|glob|grep|recall/i.test(name)?'reading':/write|edit|bash/i.test(name)?'coding':'thinking');
+          } else if (ty === 'ToolResult' || ty === 'tool_result') {
+            const tid = ev.tool_use_id||'';
+            const last = katMsg.tools.find(t => t.id === tid) || katMsg.tools[katMsg.tools.length-1];
+            const resultText = ev.result?.content || '';
+            if (last) {
+              last.icon = (ev.result&&ev.result.is_error)?'✗':'✓';
+              last.status = (ev.result&&ev.result.is_error)?'err':'ok';
+              last.result = typeof resultText === 'string' ? resultText.slice(0, 300) : '';
+            }
+            history.push({role:'user', content:[{type:'tool_result', tool_use_id: tid, content: resultText, is_error: ev.result?.is_error||false}]});
+          } else if (ty === 'Done' || ty === 'done') {
+            setStatus('idle');
+          } else if (ty === 'Error' || ty === 'error') {
+            const errMsg = (ev.error||'').slice(0, 200);
+            katMsg.error = errMsg.includes('empty response') ? '空响应 — 模型高负载，请重试' : errMsg;
+            setStatus('error');
+          }
+          renderAll();
+        } catch {}
+      }
+    }
+  } catch(e) {
+    if (e.name !== 'AbortError') {
+      katMsg.error = '连接断开: ' + e.message;
+      setStatus('error');
+      renderAll();
+    }
+  }
+
+  // Finalize: push assistant message into history
+  history.push({role:'user', content:[{type:'text', text:p}]});
+  if (assistantContent.length > 0) {
+    history.push({role:'assistant', content:assistantContent});
+  }
+  if (history.length > 30) history = history.slice(-30);
+
+  // Cleanup streaming state
+  streamAbort = null;
+  generating = false;
+  document.getElementById('send').style.display = 'block';
+  document.getElementById('stop').style.display = 'none';
+  setStatus('idle');
+}
+
+function abort() {
+  if (streamAbort) { streamAbort.abort(); streamAbort = null; }
+  generating = false;
+  document.getElementById('send').style.display = 'block';
+  document.getElementById('stop').style.display = 'none';
+  setStatus('idle');
+}
+
+// ── Helpers ─────────────────────────────────────────────
+
+function escHtml(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function setStatus(key) {
+  const dot = document.getElementById('status-dot');
+  dot.className = key||'idle';
+  const texts = {idle:'就位',thinking:'思考中',reading:'读文件',coding:'写代码',error:'出错了'};
+  document.getElementById('status-text').textContent = texts[key]||key||'就位';
+}
+
+function fmt(n) { return n?.toLocaleString?.() ?? '—'; }
+function dur(s) {
+  if (!s) return '—';
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+  return h>0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+async function refreshDash() {
+  try {
+    const r = await fetch(ENGINE+'/status', {signal:AbortSignal.timeout(3000)});
+    const s = await r.json();
+    document.getElementById('d-uptime').textContent = dur(s.session_uptime_s);
+    document.getElementById('d-turns').textContent = fmt(s.turns);
+    document.getElementById('d-tokens').textContent = fmt(s.tokens_used);
+    const p = s.context_pressure_pct||0;
+    document.getElementById('d-pressure').textContent = p+'%';
+    const bar = document.getElementById('d-bar');
+    bar.style.width = p+'%';
+    bar.className = 'bar-fill ' + (p>80?'high':p>50?'mid':'low');
+    document.getElementById('d-api').textContent = fmt(s.api_calls)+(s.api_errors?' ('+s.api_errors+')':'');
+    document.getElementById('d-rep').innerHTML = s.repetition_detected?'<span class="warn">⚠</span>':'<span class="ok">✓</span>';
+    document.getElementById('d-sleep').innerHTML = s.sleep_suggested?'<span class="err pulse">⚠ 建议休眠</span>':'<span class="ok">✓</span>';
+    document.getElementById('d-err').textContent = fmt(s.error_count_last_10m);
+  } catch {}
+}
+
+refreshDash();
+setInterval(refreshDash, 5000);
+</script>
+</body>
+</html>

@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Katherine 仪表盘</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#0d1117; color:#c9d1d9; font:13px/1.5 'Segoe UI',system-ui,sans-serif; padding:20px; }
+  h1 { font-size:18px; margin-bottom:16px; color:#58a6ff; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; }
+  .card { background:#161b22; border:1px solid #21262d; border-radius:8px; padding:14px; }
+  .card h2 { font-size:13px; color:#8b949e; margin-bottom:8px; text-transform:uppercase; letter-spacing:0.5px; }
+  .row { display:flex; justify-content:space-between; padding:3px 0; }
+  .label { color:#8b949e; }
+  .value { font-weight:600; }
+  .ok { color:#3fb950; } .warn { color:#d29922; } .err { color:#f85149; } .info { color:#58a6ff; }
+  .bar { height:6px; background:#21262d; border-radius:3px; margin-top:4px; }
+  .bar-fill { height:100%; border-radius:3px; transition:width 0.5s; }
+  .bar-fill.low { background:#3fb950; } .bar-fill.mid { background:#d29922; } .bar-fill.high { background:#f85149; }
+  #status-dot { width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:6px; }
+  #status-dot.idle { background:#3fb950; } #status-dot.degraded { background:#d29922; } #status-dot.critical { background:#f85149; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  .pulse { animation:pulse 1.5s infinite; }
+  .refresh { font-size:11px; color:#484f58; text-align:right; margin-top:16px; }
+</style>
+</head>
+<body>
+<h1>Katherine 仪表盘</h1>
+<div class="grid">
+  <div class="card">
+    <h2>引擎状态</h2>
+    <div class="row"><span class="label">状态</span><span><span id="status-dot" class="idle"></span><span id="engine-status" class="ok">就位</span></span></div>
+    <div class="row"><span class="label">运行时间</span><span id="uptime" class="value">—</span></div>
+    <div class="row"><span class="label">轮次</span><span id="turns" class="value">—</span></div>
+    <div class="row"><span class="label">工具调用</span><span id="tool-calls" class="value">—</span></div>
+    <div class="row"><span class="label">工具失败</span><span id="tool-failures" class="value">—</span></div>
+    <div class="row"><span class="label">Token 用量</span><span id="tokens" class="value">—</span></div>
+  </div>
+
+  <div class="card">
+    <h2>上下文压力</h2>
+    <div class="row"><span class="label">压力 %</span><span id="pressure-pct" class="value">—</span></div>
+    <div class="bar"><div id="pressure-bar" class="bar-fill low" style="width:0%"></div></div>
+    <div class="row" style="margin-top:8px"><span class="label">API 调用</span><span id="api-calls" class="value">—</span></div>
+    <div class="row"><span class="label">API 错误</span><span id="api-errors" class="value">—</span></div>
+    <div class="row"><span class="label">流事件</span><span id="stream-events" class="value">—</span></div>
+  </div>
+
+  <div class="card">
+    <h2>退化检测</h2>
+    <div class="row"><span class="label">重复检测</span><span id="repetition" class="value">—</span></div>
+    <div class="row"><span class="label">睡眠建议</span><span id="sleep-suggested" class="value">—</span></div>
+    <div class="row"><span class="label">错误数 (10min)</span><span id="error-count" class="value">—</span></div>
+    <div class="row"><span class="label">加权错误</span><span id="weighted-errors" class="value">—</span></div>
+    <div class="row"><span class="label">Hub 连接</span><span id="hub-connected" class="value">—</span></div>
+  </div>
+
+  <div class="card">
+    <h2>记忆系统</h2>
+    <div class="row"><span class="label">记忆总数</span><span id="mem-count" class="value">—</span></div>
+    <div class="row"><span class="label">整合状态</span><span id="consolidate-status" class="value">—</span></div>
+  </div>
+</div>
+<div class="refresh" id="refresh-time">—</div>
+
+<script>
+const ENGINE = 'http://127.0.0.1:9876';
+const HUB = 'http://127.0.0.1:8765';
+
+function fmt(n) { return n?.toLocaleString?.() ?? '—'; }
+function dur(s) {
+  if (!s) return '—';
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+  return h>0 ? `${h}h ${m}m` : `${m}m`;
+}
+function barClass(v) { return v>80 ? 'high' : v>50 ? 'mid' : 'low'; }
+
+async function refresh() {
+  try {
+    // Engine status
+    const sr = await fetch(ENGINE+'/status', {signal:AbortSignal.timeout(3000)});
+    const s = await sr.json();
+
+    document.getElementById('uptime').textContent = dur(s.session_uptime_s);
+    document.getElementById('turns').textContent = fmt(s.turns);
+    document.getElementById('tool-calls').textContent = fmt(s.tool_calls);
+    document.getElementById('tool-failures').textContent = fmt(s.tool_failures);
+    document.getElementById('tokens').textContent = fmt(s.tokens_used);
+
+    const pct = s.context_pressure_pct||0;
+    document.getElementById('pressure-pct').textContent = pct+'%';
+    const pb = document.getElementById('pressure-bar');
+    pb.style.width = pct+'%';
+    pb.className = 'bar-fill '+barClass(pct);
+
+    document.getElementById('api-calls').textContent = fmt(s.api_calls);
+    document.getElementById('api-errors').textContent = fmt(s.api_errors);
+    document.getElementById('stream-events').textContent = fmt(s.stream_events_total);
+
+    const rep = s.repetition_detected;
+    document.getElementById('repetition').innerHTML = rep ? '<span class="err">⚠ 检测到</span>' : '<span class="ok">✓ 正常</span>';
+    const sleep = s.sleep_suggested;
+    document.getElementById('sleep-suggested').innerHTML = sleep ? '<span class="err pulse">⚠ 建议休眠</span>' : '<span class="ok">✓ 正常</span>';
+    document.getElementById('error-count').textContent = fmt(s.error_count_last_10m);
+    document.getElementById('weighted-errors').textContent = fmt(s.weighted_error_count_last_10m);
+    document.getElementById('hub-connected').innerHTML = s.hub_connected ? '<span class="ok">✓ 已连接</span>' : '<span class="err">✗ 断开</span>';
+
+    // Overall status dot
+    const dot = document.getElementById('status-dot');
+    if (sleep) { dot.className = 'critical'; document.getElementById('engine-status').textContent='建议休眠'; document.getElementById('engine-status').className='err'; }
+    else if (pct>80) { dot.className = 'degraded'; document.getElementById('engine-status').textContent='压力高'; document.getElementById('engine-status').className='warn'; }
+    else { dot.className = 'idle'; document.getElementById('engine-status').textContent='健康'; document.getElementById('engine-status').className='ok'; }
+
+    // Hub
+    const hr = await fetch(HUB+'/health', {signal:AbortSignal.timeout(2000)});
+    const h = await hr.json();
+    document.getElementById('mem-count').textContent = fmt(h.memories||h.count||0);
+    document.getElementById('consolidate-status').textContent = h.memories ? '✓' : '—';
+
+  } catch(e) {
+    document.getElementById('engine-status').textContent = '离线';
+    document.getElementById('engine-status').className = 'err';
+    document.getElementById('status-dot').className = 'critical';
+  }
+  document.getElementById('refresh-time').textContent = new Date().toLocaleTimeString();
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

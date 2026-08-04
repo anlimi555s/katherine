@@ -1,0 +1,24 @@
+[package]
+name = "katherine-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Katherine CLI and MCP HTTP server"
+
+[[bin]]
+name = "Katherine"
+path = "src/launcher.rs"
+
+[[bin]]
+name = "katherine-cli"
+path = "src/main.rs"
+
+[dependencies]
+katherine-core = { path = "../katherine-core" }
+katherine-engine = { path = "../katherine-engine" }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+tokio-util = { workspace = true }
+reqwest = { workspace = true }
