@@ -1,8 +1,25 @@
-$khome = "C:\Users\Selena\Desktop\Katherine\katherine-rust"
+$khome = $PSScriptRoot
 $env:KATHERINE_HOME = $khome
-$env:ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
-$env:ANTHROPIC_AUTH_TOKEN = "sk-af98d5f7ba6743b693b5fbd8508b8c86"
-$env:ANTHROPIC_MODEL = "deepseek-v4-pro[1m]"
+
+# 从 .env 加载密钥（.env 在 .gitignore 中，不会提交）
+$envFile = Join-Path $khome ".env"
+if (Test-Path $envFile) {
+    Get-Content $envFile | ForEach-Object {
+        if ($_ -match '^\s*([^#].+?)\s*=\s*(.+)$') {
+            $name = $matches[1].Trim()
+            $value = $matches[2].Trim()
+            if ($name -notmatch '^#') {
+                Set-Item -Path "env:$name" -Value $value
+            }
+        }
+    }
+} else {
+    Write-Host "[Katherine] .env not found. Set ANTHROPIC_AUTH_TOKEN before starting."
+}
+
+# 默认值（.env 已设置则不会覆盖）
+if (-not $env:ANTHROPIC_BASE_URL) { $env:ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic" }
+if (-not $env:ANTHROPIC_MODEL) { $env:ANTHROPIC_MODEL = "deepseek-v4-pro[1m]" }
 
 Write-Host "Katherine — starting engine..."
 Start-Process -FilePath "$khome\target\release\katherine-cli.exe" -ArgumentList "serve","--port","9876" -WindowStyle Normal
