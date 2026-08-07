@@ -115,7 +115,9 @@ fn bm25_search(
             decay_curve: DecayCurve::from_str(&row.get::<_, String>(4)?),
             retrieval_count: row.get(5)?,
             last_retrieved: row.get(6)?,
-            score: 0.45 * rank, // BM25 归一化得分，后续调整
+            // FTS5 rank 为负值（越相关越负）；取负使"分高 = 更相关"，
+            // 与下游级联判定（score0 - score1 < τ）、+= 微调、降序排序的语义一致
+            score: -0.45 * rank,
         })
     })?;
 
