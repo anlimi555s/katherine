@@ -223,3 +223,80 @@ fn parse_iso_to_epoch(ts: &str) -> Option<f64> {
 
     Some((days as f64 * 86400.0) + (hour as f64 * 3600.0) + (min as f64 * 60.0) + sec as f64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::schema;
+
+    /// 建内存库：真实 schema + 触发器（与生产一致）。
+    fn setup_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        schema::create_tables(&conn).unwrap();
+        schema::create_triggers(&conn).unwrap();
+        conn
+    }
+
+    fn insert_event(conn: &rusqlite::Connection, id: &str, content: &str) {
+        conn.execute(
+            "INSERT INTO events (id, content, source, importance, decay_curve, created_at) \
+             VALUES (?1, ?2, 'dialogue', 0.5, 'exponential', '2026-08-07T00:00:00')",
+            rusqlite::params![id, content],
+        )
+        .unwrap();
+    }
+
+    /// 级联决策 bug（doc/项目代码详解.md §13 问题 2）复现：
+    /// FTS5 rank 为负数且 ORDER BY rank 升序（最相关在前），
+    /// 导致 (score0 - score1) 恒为负数 → 恒 < τ=0.05 → 恒走 Jaccard 全表兜底，
+    /// BM25 直采纳路径成死代码。
+    ///
+    /// 期望行为：BM25 有明确头名时走直采纳路径——
+    /// 只返回 FTS 命中的 2 条记忆（不掺无关条目），且头名排第一。
+    #[test]
+    fn clear_bm25_winner_takes_direct_path() {
+        let conn = setup_db();
+        // 2 条相关记忆：e1 词频高（BM25 明确头名），e2 词频低
+        const WINNER: &str = "apple apple apple apple pie";
+        const RUNNER_UP: &str = "apple orchard harvest festival";
+        insert_event(&conn, "e1", WINNER);
+        insert_event(&conn, "e2", RUNNER_UP);
+        // 6 条完全无关的记忆：Jaccard 兜底会把它们凑进 top-5
+        for i in 0..6 {
+            insert_event(&conn, &format!("n{i}"), "zebra giraffe lion elephant tiger");
+        }
+
+        // 证据 1：FTS5 原始 rank——预期为负数，越相关越小（越负越靠前）
+        let mut stmt = conn
+            .prepare(
+                "SELECT fts.rank, e.id FROM fts_events fts \
+                 JOIN events e ON fts.rowid = e.rowid \
+                 WHERE fts.content MATCH 'apple' ORDER BY fts.rank",
+            )
+            .unwrap();
+        let ranks = stmt
+            .query_map([], |r| Ok((r.get::<_, f64>(0)?, r.get::<_, String>(1)?)))
+            .unwrap();
+        eprintln!("── FTS5 原始 rank（升序，最相关在最前）──");
+        for r in ranks {
+            let (rank, id) = r.unwrap();
+            eprintln!("  rank = {rank:+.6}  id = {id}");
+        }
+
+        let results = search(&conn, "apple", 5, schema::now_epoch_secs()).unwrap();
+        eprintln!("── search() 返回 {} 条 ──", results.len());
+        for (i, c) in results.iter().enumerate() {
+            eprintln!("  #{i}: {c}");
+        }
+
+        // 直采纳路径只返回 2 条 FTS 命中；Jaccard 兜底会凑满 5 条（含 3 条无关记忆）
+        assert_eq!(
+            results.len(),
+            2,
+            "返回了 {} 条结果（含无关记忆）——级联条件恒真，BM25 直采纳路径未生效",
+            results.len()
+        );
+        // BM25 头名（rank 最负、相关性最高）应排第一
+        assert_eq!(results[0], WINNER, "BM25 头名应排第一");
+    }
+}
