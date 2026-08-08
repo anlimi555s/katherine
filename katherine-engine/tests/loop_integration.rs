@@ -15,6 +15,7 @@ use katherine_core::event::{AgentEvent, StopReason, StreamEvent};
 use katherine_core::hub::{BootData, Hub};
 use katherine_core::provider::{LlmProvider, Request};
 use katherine_core::tool::ToolResult;
+use katherine_core::types::{ContentBlock, Message, Role};
 use katherine_engine::loop_::{run_loop, LoopConfig};
 use katherine_engine::neuro_impl::MemNeuro;
 use katherine_engine::tools::ToolRegistry;
@@ -34,6 +35,32 @@ impl Hub for MockHub {
         true
     }
     async fn mark_memory(&self, _: &str, _: f32, _: &str) -> Result<(), EngineError> {
+        Ok(())
+    }
+    async fn recall(&self, _: &str, _: u32) -> Result<Vec<String>, EngineError> {
+        Ok(Vec::new())
+    }
+    async fn save_state(&self, _: &[String], _: &str, _: &str) -> Result<(), EngineError> {
+        Ok(())
+    }
+}
+
+/// 捕获型 Hub——记录 mark_memory 收到的全部内容（⑤ 复现用）。
+#[derive(Default)]
+struct CapturingHub {
+    memories: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl Hub for CapturingHub {
+    async fn boot(&self) -> Result<BootData, EngineError> {
+        Ok(BootData::default())
+    }
+    async fn health(&self) -> bool {
+        true
+    }
+    async fn mark_memory(&self, content: &str, _: f32, _: &str) -> Result<(), EngineError> {
+        self.memories.lock().unwrap().push(content.to_string());
         Ok(())
     }
     async fn recall(&self, _: &str, _: u32) -> Result<Vec<String>, EngineError> {
@@ -529,4 +556,175 @@ async fn multi_tool_parallel_execution() {
         .collect();
     assert_eq!(tool_calls.len(), 2);
     assert_eq!(tool_results.len(), 2);
+}
+
+// ── ②⑤ 复现测试（doc/项目代码详解.md §13 问题 1/5，2026-08-08）────────
+
+/// ② thinking 认知档案死代码（loop_.rs:533）复现：
+/// 流式收到的 thinking 应在一轮结束时持久化到
+/// {KATHERINE_HOME}/thinking/session-*.jsonl（thinking.rs 认知档案）。
+///
+/// 当前实现两条路径都到不了写入点：
+///   - 无工具轮次：loop_.rs:314-320 提前 return，不经过 :533；
+///   - 有工具轮次：:327 构建 assistant 消息时 mem::take 清空 thinking_buf，
+///     :533 的 is_empty() 判定恒为假。
+/// 预期红灯：thinking 目录甚至不会被创建。
+#[tokio::test]
+async fn thinking_archive_written_after_tool_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var("KATHERINE_HOME").ok();
+    std::env::set_var("KATHERINE_HOME", dir.path());
+
+    let provider = Arc::new(MockProvider::turns(vec![
+        // Turn 1：thinking + 工具调用
+        vec![
+            Ok(StreamEvent::ThinkingDelta {
+                thinking: "用户在问北极星计划，我需要查一下资料".into(),
+            }),
+            Ok(StreamEvent::ToolUseStart { id: "t1".into(), name: "Read".into() }),
+            Ok(StreamEvent::ToolUseDelta {
+                input_json: r#"{"file_path":"x"}"#.into(),
+            }),
+            Ok(StreamEvent::ToolUseEnd),
+            Ok(StreamEvent::MessageStop),
+        ],
+        // Turn 2：文本收尾
+        vec![
+            Ok(StreamEvent::TextDelta { text: "查完了".into() }),
+            Ok(StreamEvent::MessageStop),
+        ],
+    ]));
+
+    struct FakeRead;
+    impl katherine_core::tool::Tool for FakeRead {
+        fn definition(&self) -> katherine_core::tool::ToolDefinition {
+            katherine_core::tool::ToolDefinition {
+                name: "Read".into(),
+                description: "Fake".into(),
+                input_schema: serde_json::json!({}),
+                permission_level: katherine_core::tool::PermissionLevel::ReadOnly,
+            }
+        }
+        fn execute(&self, _input: serde_json::Value) -> Result<ToolResult, EngineError> {
+            Ok(ToolResult::ok("file content"))
+        }
+    }
+    let mut tools = ToolRegistry::new();
+    tools.register(FakeRead);
+
+    let stream = run_loop(
+        provider,
+        Arc::new(tools),
+        Arc::new(MockHub),
+        Arc::new(MemNeuro::new()),
+        vec![],
+        "system".into(),
+        LoopConfig::default(),
+        CancellationToken::new(),
+    );
+    let events = collect_events(stream).await;
+
+    // loop 正常走完——排除"因其他原因没到落盘点"的干扰
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Done { reason: StopReason::Completed })),
+        "loop 未正常完成：{events:?}"
+    );
+
+    // ── 证据收集（断言前完成，红灯也要能看清现场）──
+    let thinking_dir = dir.path().join("thinking");
+    let dir_exists = thinking_dir.exists();
+    let mut files: Vec<(String, String)> = Vec::new();
+    if dir_exists {
+        for entry in std::fs::read_dir(&thinking_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            files.push((name, content));
+        }
+    }
+
+    // 恢复环境变量，避免污染同进程的其他测试
+    match &prev_home {
+        Some(v) => std::env::set_var("KATHERINE_HOME", v),
+        None => std::env::remove_var("KATHERINE_HOME"),
+    }
+
+    eprintln!("── 认知档案现场 ──");
+    eprintln!("KATHERINE_HOME = {:?}", dir.path());
+    eprintln!("thinking 目录存在 = {dir_exists}");
+    eprintln!("session 文件数 = {}", files.len());
+    for (name, content) in &files {
+        eprintln!("  {name}: {} 字节", content.len());
+    }
+
+    assert!(
+        dir_exists,
+        "认知档案目录未创建——append_thinking 从未执行（loop_.rs:533 写入点不可达）"
+    );
+    assert!(!files.is_empty(), "thinking 目录下无 session 文件");
+    let all: String = files.iter().map(|(_, c)| c.as_str()).collect();
+    assert!(
+        all.contains("北极星计划"),
+        "档案中未找到本轮 thinking 内容"
+    );
+}
+
+/// ⑤ MemoryWriter 只喂 Assistant（loop_.rs:523）复现：
+/// 一轮对话结束后，长期记忆应同时包含用户原话与助手回复
+/// （chunk.rs:143-146 设计：[Selena]/[Katherine] 双标签格式）。
+///
+/// 当前实现 record_turn 的唯一生产调用点只喂 Role::Assistant，
+/// chunk.rs 里所有 Role::User 切点逻辑与 [Selena] 标签随之全灭。
+/// 预期红灯：捕获到的记忆只有 [Katherine] 独白。
+#[tokio::test]
+async fn user_messages_enter_long_term_memory() {
+    let provider = Arc::new(MockProvider::text("好的，记下了"));
+    let hub = Arc::new(CapturingHub::default());
+
+    let user_msg = Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "北极星计划的预算是 42 万".into(),
+        }],
+    };
+
+    let stream = run_loop(
+        provider,
+        Arc::new(ToolRegistry::new()),
+        hub.clone(),
+        Arc::new(MemNeuro::new()),
+        vec![user_msg],
+        "system".into(),
+        LoopConfig::default(),
+        CancellationToken::new(),
+    );
+    let events = collect_events(stream).await;
+
+    // loop 正常走完（无工具轮次在 loop_.rs:314-318 flush 后 Done）
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Done { reason: StopReason::Completed })),
+        "loop 未正常完成：{events:?}"
+    );
+
+    let memories = hub.memories.lock().unwrap();
+    eprintln!("── 长期记忆捕获（{} 块）──", memories.len());
+    for (i, m) in memories.iter().enumerate() {
+        eprintln!("  chunk #{i}: {m}");
+    }
+
+    assert!(!memories.is_empty(), "本轮对话未产生任何记忆写入");
+    let all = memories.join("\n");
+    assert!(
+        all.contains("[Katherine]"),
+        "助手侧记录缺失（预期外，需重新分析）"
+    );
+    assert!(
+        all.contains("[Selena]"),
+        "记忆中缺少用户侧记录——[Selena] 行不存在，chunk.rs 双标签设计未生效"
+    );
+    assert!(all.contains("北极星计划"), "用户原话未进入长期记忆");
 }
