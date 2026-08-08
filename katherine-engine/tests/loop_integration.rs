@@ -560,6 +560,10 @@ async fn multi_tool_parallel_execution() {
 
 // ── ②⑤ 复现测试（doc/项目代码详解.md §13 问题 1/5，2026-08-08）────────
 
+/// KATHERINE_HOME 是进程级环境变量——凡改动它的测试必须持锁串行，
+/// 防止并行测试互相读到对方的临时目录。
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// ② thinking 认知档案死代码（loop_.rs:533）复现：
 /// 流式收到的 thinking 应在一轮结束时持久化到
 /// {KATHERINE_HOME}/thinking/session-*.jsonl（thinking.rs 认知档案）。
@@ -571,6 +575,7 @@ async fn multi_tool_parallel_execution() {
 /// 预期红灯：thinking 目录甚至不会被创建。
 #[tokio::test]
 async fn thinking_archive_written_after_tool_turn() {
+    let _env_guard = ENV_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let prev_home = std::env::var("KATHERINE_HOME").ok();
     std::env::set_var("KATHERINE_HOME", dir.path());
@@ -667,6 +672,73 @@ async fn thinking_archive_written_after_tool_turn() {
     let all: String = files.iter().map(|(_, c)| c.as_str()).collect();
     assert!(
         all.contains("北极星计划"),
+        "档案中未找到本轮 thinking 内容"
+    );
+}
+
+/// ② 补充：无工具轮次的 thinking 同样应入认知档案。
+/// 无工具轮在 loop_.rs 无工具分支提前 return，历史上同样到不了写入点。
+#[tokio::test]
+async fn thinking_archive_written_after_text_only_turn() {
+    let _env_guard = ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var("KATHERINE_HOME").ok();
+    std::env::set_var("KATHERINE_HOME", dir.path());
+
+    let provider = Arc::new(MockProvider::turns(vec![vec![
+        Ok(StreamEvent::ThinkingDelta {
+            thinking: "纯聊天轮次的思考也要归档".into(),
+        }),
+        Ok(StreamEvent::TextDelta { text: "好的".into() }),
+        Ok(StreamEvent::MessageStop),
+    ]]));
+
+    let stream = run_loop(
+        provider,
+        Arc::new(ToolRegistry::new()),
+        Arc::new(MockHub),
+        Arc::new(MemNeuro::new()),
+        vec![],
+        "system".into(),
+        LoopConfig::default(),
+        CancellationToken::new(),
+    );
+    let events = collect_events(stream).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Done { reason: StopReason::Completed })),
+        "loop 未正常完成：{events:?}"
+    );
+
+    let thinking_dir = dir.path().join("thinking");
+    let dir_exists = thinking_dir.exists();
+    let mut files: Vec<(String, String)> = Vec::new();
+    if dir_exists {
+        for entry in std::fs::read_dir(&thinking_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            files.push((name, content));
+        }
+    }
+
+    match &prev_home {
+        Some(v) => std::env::set_var("KATHERINE_HOME", v),
+        None => std::env::remove_var("KATHERINE_HOME"),
+    }
+
+    eprintln!("── 认知档案现场（纯文本轮）──");
+    eprintln!("thinking 目录存在 = {dir_exists}，session 文件数 = {}", files.len());
+
+    assert!(
+        dir_exists,
+        "纯文本轮的 thinking 未归档——无工具分支到不了写入点"
+    );
+    let all: String = files.iter().map(|(_, c)| c.as_str()).collect();
+    assert!(
+        all.contains("纯聊天轮次的思考"),
         "档案中未找到本轮 thinking 内容"
     );
 }
