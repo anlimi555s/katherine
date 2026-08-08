@@ -17,6 +17,7 @@ use katherine_core::types::{ContentBlock, Message, Role};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::memory::chunk::{Role as ChunkRole, TurnRecord};
 use crate::memory::MemoryWriter;
 use crate::neuro_v3::NeuroEvent;
 use crate::security::SecurityMiddleware;
@@ -71,10 +72,38 @@ pub fn run_loop(
         };
         neuro.set_hub_connected(boot.state.is_some());
 
-        // 记忆写入器——每轮自动存 ChromaDB
+        // 记忆写入器——每轮自动切块存 libSQL
         let mut memory_writer = MemoryWriter::new(hub.clone());
 
         let mut messages = messages;
+
+        // ── 用户消息入记忆 ─────────────────────────
+        // 每次 run_loop 调用对应一条新用户输入（REPL/HTTP 均在调用前 push），
+        // 且 MemoryWriter 随调用新建——只喂最后一条 User 文本，不重喂历史。
+        // （工具结果消息也是 User 角色但无 Text 块，天然被过滤。）
+        if let Some(user_text) = messages.last().and_then(|m| {
+            if m.role == Role::User {
+                let text = m
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if text.is_empty() { None } else { Some(text) }
+            } else {
+                None
+            }
+        }) {
+            memory_writer.record_turn(TurnRecord {
+                role: ChunkRole::User,
+                text: user_text,
+                ts: std::time::SystemTime::now(),
+                has_tool_calls: false,
+            });
+        }
         let mut turn = 0u32;
         let mut total_tokens: u64 = 0;
 
@@ -274,6 +303,27 @@ pub fn run_loop(
                 yield AgentEvent::tool_call(&tb.id, &tb.name, input);
             }
 
+            // ── 自动存记忆——每轮记录助手侧（文本 + 工具标记）──
+            // 必须位于无工具轮次提前 return 之前——否则纯聊天轮不落记忆。
+            {
+                let mut parts: Vec<String> = Vec::new();
+                if !text_buf.is_empty() {
+                    parts.push(text_buf.clone());
+                }
+                for tb in &tool_blocks {
+                    parts.push(format!("[tool:{}]", tb.name));
+                }
+                let record_text = parts.join(" ");
+                if !record_text.is_empty() {
+                    memory_writer.record_turn(TurnRecord {
+                        role: ChunkRole::Assistant,
+                        text: record_text,
+                        ts: std::time::SystemTime::now(),
+                        has_tool_calls: !tool_blocks.is_empty(),
+                    });
+                }
+            }
+
             // ── 空响应检查 ──────────────────────────
             // provider 已处理重试——到这里就是最终空响应。
             if tool_blocks.is_empty() && text_buf.is_empty() {
@@ -292,6 +342,7 @@ pub fn run_loop(
                         turn,
                     });
                 }
+                memory_writer.flush().await;
                 yield AgentEvent::Error { error: err.to_string() };
                 yield AgentEvent::done(StopReason::Error);
                 return;
@@ -301,6 +352,8 @@ pub fn run_loop(
             if let Some(ref e) = stream_error {
                 if tool_blocks.is_empty() {
                     // 只有文本——产出已有文本然后结束
+                    archive_thinking(&thinking_dir, turn, &mut thinking_buf, &tool_blocks, &[], &mut last_thinking_id, &mut had_correction_prev_turn);
+                    memory_writer.flush().await;
                     let _ = hub.save_state(&[], "清醒", "low").await;
                     neuro.record_turn(turn, total_tokens, 0);
                     yield AgentEvent::done(StopReason::Error);
@@ -312,6 +365,7 @@ pub fn run_loop(
 
             // ── 无工具 = 完成 ────────────────────────
             if tool_blocks.is_empty() {
+                archive_thinking(&thinking_dir, turn, &mut thinking_buf, &tool_blocks, &[], &mut last_thinking_id, &mut had_correction_prev_turn);
                 memory_writer.flush().await;
                 let _ = hub.save_state(&[], "清醒", "low").await;
                 neuro.record_turn(turn, total_tokens, 0);
@@ -324,7 +378,8 @@ pub fn run_loop(
             // thinking 必须放在 text 前面（Anthropic API 要求）
             if !thinking_buf.is_empty() {
                 assistant_content.push(ContentBlock::Thinking {
-                    thinking: std::mem::take(&mut thinking_buf),
+                    // clone 而非 take——缓冲区要留到工具执行后写认知档案
+                    thinking: thinking_buf.clone(),
                     signature: std::mem::take(&mut thinking_sig),
                 });
             }
@@ -503,61 +558,16 @@ pub fn run_loop(
                 })
             };
 
-            // ── 自动存记忆——写入 ChromaDB（在 assistant_content 被移动前）──
-            {
-                use crate::memory::chunk::{Role, TurnRecord};
-                let record_text = if assistant_content.is_empty() {
-                    format!("[{} tool calls]", tool_blocks.len())
-                } else {
-                    assistant_content
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text { text } => Some(text.clone()),
-                            ContentBlock::ToolUse { name, .. } => Some(format!("[tool:{name}]")),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                };
-                if !record_text.is_empty() {
-                    memory_writer.record_turn(TurnRecord {
-                        role: Role::Assistant,
-                        text: record_text,
-                        ts: std::time::SystemTime::now(),
-                        has_tool_calls: !tool_blocks.is_empty(),
-                    });
-                }
-            }
-
-            // ── 认知档案：写入 thinking 记录 ──────────────────
-            if !thinking_buf.is_empty() {
-                let tools_called: Vec<String> = tool_blocks.iter().map(|tb| tb.name.clone()).collect();
-                let had_correction = tools_called.iter().any(|n| n == "mark_memory" || n == "save_decision");
-                let recall_hits = tool_results.iter()
-                    .filter(|(_, tr)| !tr.is_error && tr.content.contains('\n'))
-                    .count();
-
-                let record = ThinkingRecord {
-                    turn,
-                    timestamp: thinking::now_timestamp(),
-                    thinking_len: thinking_buf.len(),
-                    thinking: std::mem::take(&mut thinking_buf),
-                    importance: thinking::compute_thinking_importance(&tools_called, had_correction),
-                    had_correction,
-                    tools_called,
-                    recall_hits,
-                    previous_thinking_id: if had_correction_prev_turn {
-                        last_thinking_id.clone()
-                    } else {
-                        None
-                    },
-                };
-
-                last_thinking_id = Some(format!("session-{}-turn-{}", &record.timestamp[..10], turn));
-                had_correction_prev_turn = had_correction;
-
-                thinking::append_thinking(&thinking_dir, &record);
-            }
+            // ── 认知档案：写入 thinking 记录（工具轮——带真实 recall_hits）──
+            archive_thinking(
+                &thinking_dir,
+                turn,
+                &mut thinking_buf,
+                &tool_blocks,
+                &tool_results,
+                &mut last_thinking_id,
+                &mut had_correction_prev_turn,
+            );
 
             // ── 下一轮 ────────────────────────────
             messages.push(Message {
@@ -701,6 +711,51 @@ pub fn run_loop(
 }
 
 // ── Types ──────────────────────────────────────────────────
+
+/// 认知档案：把本轮 thinking 落盘到 {thinking_dir}/session-*.jsonl。
+/// 工具轮传真实 tool_results（recall_hits 统计）；无工具轮传 &[]。
+/// 从 thinking_buf 取走内容（take）——调用后缓冲区清空。
+#[allow(clippy::too_many_arguments)]
+fn archive_thinking(
+    thinking_dir: &std::path::PathBuf,
+    turn: u32,
+    thinking_buf: &mut String,
+    tool_blocks: &[ToolCallPending],
+    tool_results: &[(String, ToolResult)],
+    last_thinking_id: &mut Option<String>,
+    had_correction_prev_turn: &mut bool,
+) {
+    if thinking_buf.is_empty() {
+        return;
+    }
+    let tools_called: Vec<String> = tool_blocks.iter().map(|tb| tb.name.clone()).collect();
+    let had_correction = tools_called.iter().any(|n| n == "mark_memory" || n == "save_decision");
+    let recall_hits = tool_results
+        .iter()
+        .filter(|(_, tr)| !tr.is_error && tr.content.contains('\n'))
+        .count();
+
+    let record = ThinkingRecord {
+        turn,
+        timestamp: thinking::now_timestamp(),
+        thinking_len: thinking_buf.len(),
+        thinking: std::mem::take(thinking_buf),
+        importance: thinking::compute_thinking_importance(&tools_called, had_correction),
+        had_correction,
+        tools_called,
+        recall_hits,
+        previous_thinking_id: if *had_correction_prev_turn {
+            last_thinking_id.clone()
+        } else {
+            None
+        },
+    };
+
+    *last_thinking_id = Some(format!("session-{}-turn-{}", &record.timestamp[..10], turn));
+    *had_correction_prev_turn = had_correction;
+
+    thinking::append_thinking(thinking_dir, &record);
+}
 
 #[derive(Debug, Clone)]
 struct ToolCallPending {
